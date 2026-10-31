@@ -1,0 +1,98 @@
+# Controleert elke 10 minuten of de server van WorkBudy (Supabase) antwoordt.
+#
+# Aanleiding (31 okt 2026): de database-API (PostgREST) hing. Inloggen lukte nog,
+# maar daarna kon de app niets ophalen (foutcode PGRST003), voor iedereen. Een klant
+# merkte het als eerste. Nu opent deze controle een issue in deze repository
+# (daar komt een e-mail van) en sluit die weer zodra alles werkt.
+#
+# Gezond: inloggen-dienst geeft 200, en de database-API antwoordt binnen 15 s met
+# een status onder 500. Anoniem geeft die 401 (geen toegang tot bedrijfsgegevens):
+# dat is goed, want dan heeft hij de database bereikt. Drie pogingen met 20 s
+# ertussen, zodat een enkele hapering geen melding geeft.
+
+name: API-controle WorkBudy
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+
+permissions:
+  issues: write
+
+concurrency:
+  group: api-controle
+  cancel-in-progress: false
+
+jobs:
+  controle:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Server testen
+        id: test
+        env:
+          URL: ${{ secrets.SUPABASE_URL }}
+          KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+        run: |
+          if [ -z "$URL" ] || [ -z "$KEY" ]; then
+            # nog niet ingesteld: geen valse storingsmelding, wel zichtbaar in de run
+            echo "::warning::Geheimen SUPABASE_URL en SUPABASE_ANON_KEY ontbreken (Settings → Secrets and variables → Actions)"
+            echo "ok=skip" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          for poging in 1 2 3; do
+            rest=$(curl -s -m 15 -o rest.txt -w '%{http_code}' "$URL/rest/v1/companies?select=id&limit=1" -H "apikey: $KEY" || true)
+            auth=$(curl -s -m 15 -o /dev/null -w '%{http_code}' "$URL/auth/v1/health" -H "apikey: $KEY" || true)
+            echo "poging $poging: database-API $rest, inloggen $auth"
+            if [ "$auth" = "200" ] && [ -n "$rest" ] && [ "$rest" != "000" ] && [ "$rest" -lt 500 ]; then
+              echo "ok=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            [ "$poging" -lt 3 ] && sleep 20
+          done
+          echo "ok=false" >> "$GITHUB_OUTPUT"
+          {
+            echo "rest=$rest"
+            echo "auth=$auth"
+            echo "body=$(head -c 300 rest.txt 2>/dev/null | tr -d '\n\r')"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Storing melden
+        if: steps.test.outputs.ok == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REST: ${{ steps.test.outputs.rest }}
+          AUTH: ${{ steps.test.outputs.auth }}
+          BODY: ${{ steps.test.outputs.body }}
+        run: |
+          open=$(gh issue list --repo "$GITHUB_REPOSITORY" --label storing --state open --json number --jq 'length')
+          if [ "$open" = "0" ]; then
+            gh issue create --repo "$GITHUB_REPOSITORY" --label storing \
+              --title "Storing: WorkBudy-server antwoordt niet" \
+              --body "$(cat <<EOF
+          De controle van $(date -u '+%d-%m-%Y %H:%M') UTC kreeg na drie pogingen geen goed antwoord.
+
+          - Database-API (gegevens): \`${REST:-000}\` (000 = geen antwoord binnen 15 s)
+          - Inloggen: \`${AUTH:-000}\` (200 = goed)
+          - Antwoord van de database-API: \`${BODY:-leeg}\`
+
+          **Wat te doen**
+          1. Supabase-dashboard → project *workbuddy* → Project Settings → General → **Restart project** (een paar minuten onbereikbaar).
+          2. Staat het project op *paused* (gratis abonnement na een week zonder gebruik): daar op *Restore* klikken.
+          3. Dit issue gaat vanzelf dicht zodra de controle weer slaagt.
+
+          Achtergrond: BUILDLOG 31 okt 2026 (PGRST003).
+          EOF
+          )"
+          fi
+          exit 1
+
+      - name: Opgelost melden
+        if: steps.test.outputs.ok == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for nr in $(gh issue list --repo "$GITHUB_REPOSITORY" --label storing --state open --json number --jq '.[].number'); do
+            gh issue close "$nr" --repo "$GITHUB_REPOSITORY" --comment "Weer in orde sinds $(date -u '+%d-%m-%Y %H:%M') UTC."
+          done
